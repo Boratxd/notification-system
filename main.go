@@ -5,13 +5,17 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func main() {
-	dbURL := "postgres://notif:notif@localhost:5432/notifications?sslmode=disable"
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		dbURL = "postgres://notif:notif@localhost:5432/notifications?sslmode=disable"
+	}
 	pool, err := pgxpool.New(context.Background(), dbURL)
 	if err != nil {
 		log.Fatal(err)

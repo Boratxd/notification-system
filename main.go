@@ -112,6 +112,39 @@ func getNotificationHandler(pool *pgxpool.Pool) http.HandlerFunc {
 		writeJSON(w, http.StatusOK, n)
 	}
 }
+func cancelNotificationHandler(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if _, err := uuid.Parse(id); err != nil {
+			writeError(w, http.StatusBadRequest, " Invalid Notification ID!")
+			return
+		}
+		var cancelledID string
+		err := pool.QueryRow(r.Context(), `UPDATE notifications SET status = 'cancalled', updated_at = now() WHERE id = $1 AND status = 'pending' RETURNING id::text`, id).Scan(&cancelledID)
+
+		if err == nil {
+			writeJSON(w, http.StatusOK, map[string]string{"id": cancelledID, "status": "cancelled"})
+			return
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			log.Printf("cancel failed: %v", err)
+			writeError(w, http.StatusInternalServerError, "Could not cancel the notification")
+			return
+		}
+		var currentStatus string
+		err = pool.QueryRow(r.Context(), `SELECT status FROM notifications WHERE id = $1`, id).Scan(&currentStatus)
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "Notification can not be found")
+			return
+		}
+		if err != nil {
+			log.Printf("Notification status lookup failed: %v", err)
+			writeError(w, http.StatusInternalServerError, "Could not read the notification")
+			return
+		}
+		writeError(w, http.StatusConflict, "Only pening notifications can be cancelled")
+	}
+}
 
 func main() {
 	dbURL := os.Getenv("DATABASE_URL")
@@ -135,6 +168,7 @@ func main() {
 
 	http.HandleFunc("POST /notifications", createNotificationHandler(pool))
 	http.HandleFunc("GET /notifications/{id}", getNotificationHandler(pool))
+	http.HandleFunc("POST /notifications/{id}/cancel", cancelNotificationHandler(pool))
 	fmt.Println("Listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }

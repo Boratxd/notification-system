@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -20,7 +22,18 @@ type createNotificationRequest struct {
 	Content   string `json:"content"`
 	Priority  string `json:"priority"`
 }
+type notificationResponse struct {
+	ID        string    `json:"id"`
+	Recipient string    `json:"recipient"`
+	Channel   string    `json:"channel"`
+	Content   string    `json:"content"`
+	Priority  string    `json:"priority"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
 
+var priorityNames = map[int]string{0: "high", 1: "normal", 2: "low"}
 var priorities = map[string]int{"high": 0, "normal": 1, "low": 2}
 var maxContentLenght = map[string]int{"sms": 160, "email": 10000, "push": 256}
 
@@ -74,6 +87,32 @@ func createNotificationHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	}
 }
 
+func getNotificationHandler(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if _, err := uuid.Parse(id); err != nil {
+			writeError(w, http.StatusBadRequest, "Invalid id")
+			return
+		}
+
+		var n notificationResponse
+		var priority int
+		err := pool.QueryRow(r.Context(), `SELECT id::text, recipient, channel, content, priority, status, created_at, updated_at FROM notifications WHERE id = $1`, id).Scan(&n.ID, &n.Recipient, &n.Channel, &n.Content, &priority, &n.Status, &n.CreatedAt, &n.UpdatedAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "Notification can not be found")
+			return
+		}
+		if err != nil {
+			log.Printf("Query Failed: %v", err)
+			writeError(w, http.StatusInternalServerError, "Could not read the notification")
+			return
+		}
+
+		n.Priority = priorityNames[priority]
+		writeJSON(w, http.StatusOK, n)
+	}
+}
+
 func main() {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
@@ -95,6 +134,7 @@ func main() {
 	})
 
 	http.HandleFunc("POST /notifications", createNotificationHandler(pool))
+	http.HandleFunc("GET /notifications/{id}", getNotificationHandler(pool))
 	fmt.Println("Listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }

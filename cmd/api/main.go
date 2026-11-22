@@ -77,15 +77,39 @@ func createNotificationHandler(pool *pgxpool.Pool) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "Priority must be high, normal or low")
 			return
 		}
+		var kArg any
+		key := r.Header.Get("Idempotency-Key")
+		if key != "" {
+			kArg = key
+		}
 
 		id := uuid.New()
-		_, err := pool.Exec(r.Context(), `INSERT INTO notifications (id,recipient,channel,content,priority) VALUES ($1, $2, $3, $4, $5)`, id.String(), req.Recipient, req.Channel, req.Content, priority)
-		if err != nil {
-			log.Printf("insert failed: %v", err)
+		var insertedID string
+		err := pool.QueryRow(r.Context(), `
+			INSERT INTO notifications (id, recipient, channel, content, priority, idempotency_key)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+			RETURNING id::text`,
+			id.String(), req.Recipient, req.Channel, req.Content, priority, kArg).Scan(&insertedID)
+
+		if err == nil {
+			writeJSON(w, http.StatusAccepted, map[string]string{"id": insertedID, "status": "pending"})
+			return
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			log.Printf("insert Failed: %v", err)
 			writeError(w, http.StatusInternalServerError, "Could not save the notification")
 			return
 		}
-		writeJSON(w, http.StatusAccepted, map[string]string{"id": id.String(), "status": "pending"})
+		var existingID, existingStatus string
+		err = pool.QueryRow(r.Context(),
+			`SELECT id::text, status FROM notifications WHERE idempotency_key = $1`, key).Scan(&existingID, &existingStatus)
+		if err != nil {
+			log.Printf("idempotency lookup failed: %v", err)
+			writeError(w, http.StatusInternalServerError, "Could not save the notification")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"id": existingID, "status": existingStatus, "idempotent_replay": "true"})
 	}
 }
 

@@ -8,6 +8,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -120,7 +122,7 @@ func cancelNotificationHandler(pool *pgxpool.Pool) http.HandlerFunc {
 			return
 		}
 		var cancelledID string
-		err := pool.QueryRow(r.Context(), `UPDATE notifications SET status = 'cancalled', updated_at = now() WHERE id = $1 AND status = 'pending' RETURNING id::text`, id).Scan(&cancelledID)
+		err := pool.QueryRow(r.Context(), `UPDATE notifications SET status = 'cancelled', updated_at = now() WHERE id = $1 AND status = 'pending' RETURNING id::text`, id).Scan(&cancelledID)
 
 		if err == nil {
 			writeJSON(w, http.StatusOK, map[string]string{"id": cancelledID, "status": "cancelled"})
@@ -143,6 +145,89 @@ func cancelNotificationHandler(pool *pgxpool.Pool) http.HandlerFunc {
 			return
 		}
 		writeError(w, http.StatusConflict, "Only pening notifications can be cancelled")
+	}
+}
+
+func listNotificationsHandler(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		limit, offset := 20, 0
+		if v := q.Get("limit"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 || n > 100 {
+				writeError(w, http.StatusBadRequest, "limit must be between 1 and 100")
+				return
+			}
+			limit = n
+		}
+		if v := q.Get("offset"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 {
+				writeError(w, http.StatusBadRequest, "offset must be 0 or greater")
+				return
+			}
+			offset = n
+		}
+		var conditions []string
+		var args []any
+		addFilter := func(clause string, value any) {
+			args = append(args, value)
+			conditions = append(conditions, fmt.Sprintf(clause, len(args)))
+		}
+		if v := q.Get("status"); v != "" {
+			addFilter("status = $%d", v)
+		}
+		if v := q.Get("channel"); v != "" {
+			addFilter("channel = $%d", v)
+		}
+		if v := q.Get("from"); v != "" {
+			t, err := time.Parse(time.RFC3339, v)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "from must be an RFC3339 timestamp")
+				return
+			}
+			addFilter("created_at>=$%d", t)
+		}
+		if v := q.Get("to"); v != "" {
+			t, err := time.Parse(time.RFC3339, v)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "to must be an RFC3330 timestamp")
+				return
+			}
+			addFilter("created_at<=$%d", t)
+		}
+		where := ""
+		if len(conditions) > 0 {
+			where = "WHERE " + strings.Join(conditions, " AND ")
+		}
+		args = append(args, limit, offset)
+		query := fmt.Sprintf(`SELECT id::text, recipient, channel, content, priority, status, created_at, updated_at FROM notifications %s ORDER BY created_at DESC, id LIMIT $%d OFFSET $%d`, where, len(args)-1, len(args))
+		rows, err := pool.Query(r.Context(), query, args...)
+		if err != nil {
+			log.Printf("list query failed: %v", err)
+			writeError(w, http.StatusInternalServerError, "Could not list notifications")
+			return
+		}
+		defer rows.Close()
+
+		items := []notificationResponse{}
+		for rows.Next() {
+			var n notificationResponse
+			var priority int
+			if err := rows.Scan(&n.ID, &n.Recipient, &n.Channel, &n.Content, &priority, &n.Status, &n.CreatedAt, &n.UpdatedAt); err != nil {
+				log.Printf("list scan failed: %v", err)
+				writeError(w, http.StatusInternalServerError, "Could not read notifications")
+				return
+			}
+			n.Priority = priorityNames[priority]
+			items = append(items, n)
+		}
+		if err := rows.Err(); err != nil {
+			log.Printf("list rows failed: %v", err)
+			writeError(w, http.StatusInternalServerError, "Could not read notifications")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data": items, "limit": limit, "offset": offset})
 	}
 }
 
@@ -169,6 +254,7 @@ func main() {
 	http.HandleFunc("POST /notifications", createNotificationHandler(pool))
 	http.HandleFunc("GET /notifications/{id}", getNotificationHandler(pool))
 	http.HandleFunc("POST /notifications/{id}/cancel", cancelNotificationHandler(pool))
+	http.HandleFunc("GET /notifications", listNotificationsHandler(pool))
 	fmt.Println("Listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }

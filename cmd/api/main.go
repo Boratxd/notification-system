@@ -345,6 +345,53 @@ func createBatchHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	}
 }
 
+func metricsHandler(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+
+		var pending, processing, sent, failed, cancelled int64
+		err := pool.QueryRow(ctx, `
+			SELECT
+			  count(*) FILTER (WHERE status = 'pending'),
+			  count(*) FILTER (WHERE status = 'processing'),
+			  count(*) FILTER (WHERE status = 'sent'),
+			  count(*) FILTER (WHERE status = 'failed'),
+			  count(*) FILTER (WHERE status = 'cancelled')
+			FROM notifications`).Scan(&pending, &processing, &sent, &failed, &cancelled)
+		if err != nil {
+			log.Printf("metrics counts failed: %v", err)
+			writeError(w, http.StatusInternalServerError, "Could not compute metrics")
+			return
+		}
+
+		var avgLatency, p95Latency float64
+		err = pool.QueryRow(ctx, `
+			SELECT
+			  coalesce(avg(extract(epoch FROM (sent_at - created_at)))::float8, 0),
+			  coalesce(percentile_cont(0.95) WITHIN GROUP
+			    (ORDER BY extract(epoch FROM (sent_at - created_at))::float8), 0)::float8
+			FROM notifications
+			WHERE status = 'sent' AND sent_at > now() - interval '1 hour'`).Scan(&avgLatency, &p95Latency)
+		if err != nil {
+			log.Printf("metrics latency failed: %v", err)
+			writeError(w, http.StatusInternalServerError, "Could not compute metrics")
+			return
+		}
+
+		successRate := 0.0
+		if finished := sent + failed; finished > 0 {
+			successRate = float64(sent) / float64(finished)
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"queue_depth":                        map[string]int64{"pending": pending, "processing": processing},
+			"totals":                             map[string]int64{"sent": sent, "failed": failed, "cancelled": cancelled},
+			"success_rate":                       successRate,
+			"delivery_latency_seconds_last_hour": map[string]float64{"avg": avgLatency, "p95": p95Latency},
+		})
+	}
+}
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	dbURL := os.Getenv("DATABASE_URL")
@@ -371,6 +418,7 @@ func main() {
 	http.HandleFunc("POST /notifications/{id}/cancel", cancelNotificationHandler(pool))
 	http.HandleFunc("GET /notifications", listNotificationsHandler(pool))
 	http.HandleFunc("POST /notifications/batch", createBatchHandler(pool))
+	http.HandleFunc("GET /metrics", metricsHandler(pool))
 	logger.Info("api listening", "addr", ":8080")
 	log.Fatal(http.ListenAndServe(":8080", withLogging(logger, http.DefaultServeMux)))
 }

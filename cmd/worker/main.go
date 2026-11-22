@@ -28,10 +28,11 @@ const (
 )
 
 type job struct {
-	ID        string
-	Recipient string
-	Channel   string
-	Content   string
+	ID            string
+	Recipient     string
+	Channel       string
+	Content       string
+	CorrelationID string
 }
 
 type providerResponse struct {
@@ -139,7 +140,7 @@ func claim(ctx context.Context, pool *pgxpool.Pool, limit int) ([]job, error) {
 			LIMIT $1
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING id::text, recipient, channel, content`, limit)
+		RETURNING id::text, recipient, channel, content, coalesce(correlation_id,'')`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -147,7 +148,7 @@ func claim(ctx context.Context, pool *pgxpool.Pool, limit int) ([]job, error) {
 	var jobs []job
 	for rows.Next() {
 		var j job
-		if err := rows.Scan(&j.ID, &j.Recipient, &j.Channel, &j.Content); err != nil {
+		if err := rows.Scan(&j.ID, &j.Recipient, &j.Channel, &j.Content, &j.CorrelationID); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, j)
@@ -156,6 +157,7 @@ func claim(ctx context.Context, pool *pgxpool.Pool, limit int) ([]job, error) {
 }
 
 func process(ctx context.Context, pool *pgxpool.Pool, client *http.Client, url string, logger *slog.Logger, j job) {
+	logger = logger.With("correlation_id", j.CorrelationID)
 	body, _ := json.Marshal(map[string]string{"to": j.Recipient, "channel": j.Channel, "content": j.Content})
 
 	resp, err := client.Post(url, "application/json", bytes.NewReader(body))

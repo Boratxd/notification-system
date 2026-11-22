@@ -9,6 +9,47 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notif -d notifications"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    image: migrate/migrate
+    volumes:
+      - ./migrations:/migrations:ro
+    command: ["-path", "/migrations", "-database", "postgres://notif:notif@postgres:5432/notifications?sslmode=disable", "up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  mockprovider:
+    build: .
+    command: ["mockprovider"]
+
+  api:
+    build: .
+    command: ["api"]
+    environment:
+      DATABASE_URL: postgres://notif:notif@postgres:5432/notifications?sslmode=disable
+    ports:
+      - "8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    build: .
+    command: ["worker"]
+    environment:
+      DATABASE_URL: postgres://notif:notif@postgres:5432/notifications?sslmode=disable
+      WEBHOOK_URL: ${WEBHOOK_URL:-http://mockprovider:9090/}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      mockprovider:
+        condition: service_started
 
 volumes:
   pgdata:

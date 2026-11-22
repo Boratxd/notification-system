@@ -424,16 +424,7 @@ func main() {
 		log.Fatal(err)
 	}
 	defer pool.Close()
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		defer cancel()
-		if err := pool.Ping(ctx); err != nil {
-			http.Error(w, "database down", http.StatusServiceUnavailable)
-			return
-		}
-		fmt.Fprintln(w, "ok")
-	})
 
 	logger.Info("api listening", "addr", ":8080")
-	log.Fatal(http.ListenAndServe(":8080", withLogging(logger, http.DefaultServeMux)))
+	log.Fatal(http.ListenAndServe(":8080", withLogging(logger, newMux(pool))))
 }

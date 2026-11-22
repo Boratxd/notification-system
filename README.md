@@ -137,4 +137,4 @@ All 500 were delivered in about 5 seconds and the rate stayed at about 100 per s
 
 ## AI usage
 
-- In the development Claude used as a pair-programming partner and tutor. It help me to build the design, explained the not well known concept like testing and indempotency. Some parts of the testing methos has been(also openapi.yaml) fixed and written by ai. I ran every step, fixed my own mistakes along the way. Carefully observed the error codes and integration tests,The ReadMe decisions and limitations reflect what I understand of the system.
+- In the development Claude used as a pair-programming partner and tutor. It help me to build the design, explained the not well known concept like testing and indempotency. The testing methos has been(also openapi.yaml) fixed and written by ai. I ran every step, fixed my own mistakes along the way. Carefully observed the error codes and integration tests,The ReadMe decisions and limitations reflect what I understand of the system.

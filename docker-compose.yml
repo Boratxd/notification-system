@@ -14,6 +14,14 @@ services:
       interval: 3s
       timeout: 3s
       retries: 20
+  swagger:
+    image: swaggerapi/swagger-ui
+    environment:
+      SWAGGER_JSON: /spec/openapi.yaml
+    volumes:
+      - ./openapi.yaml:/spec/ope
+    ports:
+      - "8081:8080"
 
   migrate:
     image: migrate/migrate

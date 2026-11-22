@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
@@ -81,11 +82,11 @@ func createNotificationHandler(pool *pgxpool.Pool) http.HandlerFunc {
 		id := uuid.New()
 		var insertedID string
 		err := pool.QueryRow(r.Context(), `
-			INSERT INTO notifications (id, recipient, channel, content, priority, idempotency_key)
-			VALUES ($1, $2, $3, $4, $5, $6)
+			INSERT INTO notifications (id, recipient, channel, content, priority, idempotency_key, correlation_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
 			ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
 			RETURNING id::text`,
-			id.String(), req.Recipient, req.Channel, req.Content, priority, kArg).Scan(&insertedID)
+			id.String(), req.Recipient, req.Channel, req.Content, priority, kArg, correlationID(r.Context())).Scan(&insertedID)
 
 		if err == nil {
 			writeJSON(w, http.StatusAccepted, map[string]string{"id": insertedID, "status": "pending"})
@@ -324,9 +325,9 @@ func createBatchHandler(pool *pgxpool.Pool) http.HandlerFunc {
 		for i, n := range req.Notifications {
 			id := uuid.New().String()
 			_, err := tx.Exec(ctx, `
-				INSERT INTO notifications (id, batch_id, recipient, channel, content, priority)
-				VALUES ($1, $2, $3, $4, $5, $6)`,
-				id, batchID, n.Recipient, n.Channel, n.Content, prios[i])
+				INSERT INTO notifications (id, batch_id, recipient, channel, content, priority, correlation_id)
+				VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+				id, batchID, n.Recipient, n.Channel, n.Content, prios[i], correlationID(ctx))
 			if err != nil {
 				log.Printf("batch insert failed at index %d: %v", i, err)
 				writeError(w, http.StatusInternalServerError, "Could not save the batch")
@@ -345,6 +346,7 @@ func createBatchHandler(pool *pgxpool.Pool) http.HandlerFunc {
 }
 
 func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
 		dbURL = "postgres://notif:notif@localhost:5432/notifications?sslmode=disable"
@@ -369,6 +371,6 @@ func main() {
 	http.HandleFunc("POST /notifications/{id}/cancel", cancelNotificationHandler(pool))
 	http.HandleFunc("GET /notifications", listNotificationsHandler(pool))
 	http.HandleFunc("POST /notifications/batch", createBatchHandler(pool))
-	fmt.Println("Listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	logger.Info("api listening", "addr", ":8080")
+	log.Fatal(http.ListenAndServe(":8080", withLogging(logger, http.DefaultServeMux)))
 }

@@ -35,9 +35,20 @@ type notificationResponse struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+type batchRequest struct {
+	Notifications []createNotificationRequest `json:"notifications"`
+}
+
+type batchError struct {
+	Index int    `json:"index"`
+	Error string `json:"error"`
+}
+
 var priorityNames = map[int]string{0: "high", 1: "normal", 2: "low"}
 var priorities = map[string]int{"high": 0, "normal": 1, "low": 2}
 var maxContentLenght = map[string]int{"sms": 160, "email": 10000, "push": 256}
+
+const maxBatchSize = 1000
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -56,25 +67,9 @@ func createNotificationHandler(pool *pgxpool.Pool) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "invalid JSON")
 			return
 		}
-		if req.Recipient == "" || req.Content == "" {
-			writeError(w, http.StatusBadRequest, "recipient and content are required")
-			return
-		}
-		limit, ok := maxContentLenght[req.Channel]
-		if !ok {
-			writeError(w, http.StatusBadRequest, "The channel must be sms, email or push")
-			return
-		}
-		if len([]rune(req.Content)) > limit {
-			writeError(w, http.StatusBadRequest, "Notification content exceeds the limit for this channel")
-			return
-		}
-		if req.Priority == "" {
-			req.Priority = "normal"
-		}
-		priority, ok := priorities[req.Priority]
-		if !ok {
-			writeError(w, http.StatusBadRequest, "Priority must be high, normal or low")
+		priority, msg := validateNotification(req)
+		if msg != "" {
+			writeError(w, http.StatusBadRequest, msg)
 			return
 		}
 		var kArg any
@@ -204,6 +199,15 @@ func listNotificationsHandler(pool *pgxpool.Pool) http.HandlerFunc {
 		if v := q.Get("channel"); v != "" {
 			addFilter("channel = $%d", v)
 		}
+
+		if v := q.Get("batch_id"); v != "" {
+			if _, err := uuid.Parse(v); err != nil {
+				writeError(w, http.StatusBadRequest, "batch_id must be a valid UUID")
+				return
+			}
+			addFilter("batch_id = $%d", v)
+		}
+
 		if v := q.Get("from"); v != "" {
 			t, err := time.Parse(time.RFC3339, v)
 			if err != nil {
@@ -255,6 +259,91 @@ func listNotificationsHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	}
 }
 
+func validateNotification(req createNotificationRequest) (int, string) {
+	if req.Recipient == "" || req.Content == "" {
+		return 0, "Recipient and content needed"
+	}
+	limit, ok := maxContentLenght[req.Channel]
+	if !ok {
+		return 0, "Channel must be either sms,email or push"
+	}
+	if len([]rune(req.Content)) > limit {
+		return 0, "content exceeds the limit of the channel"
+	}
+	if req.Priority == "" {
+		req.Priority = "normal"
+	}
+	priority, ok := priorities[req.Priority]
+	if !ok {
+		return 0, "priority must be high,normal or low"
+	}
+	return priority, ""
+}
+
+func createBatchHandler(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 5<<20)
+		var req batchRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON or body too large")
+			return
+		}
+		if len(req.Notifications) == 0 {
+			writeError(w, http.StatusBadRequest, "notifications must not be empty")
+			return
+		}
+		if len(req.Notifications) > maxBatchSize {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("a batch can contain at most %d notifications", maxBatchSize))
+			return
+		}
+		prios := make([]int, len(req.Notifications))
+		var problems []batchError
+		for i, n := range req.Notifications {
+			p, msg := validateNotification(n)
+			if msg != "" {
+				problems = append(problems, batchError{Index: i, Error: msg})
+				continue
+			}
+			prios[i] = p
+		}
+		if len(problems) > 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "validation failed", "details": problems})
+			return
+		}
+		ctx := r.Context()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			log.Printf("begin failed: %v", err)
+			writeError(w, http.StatusInternalServerError, "Could not save the batch")
+			return
+		}
+		defer tx.Rollback(ctx)
+
+		batchID := uuid.New().String()
+		ids := make([]string, 0, len(req.Notifications))
+		for i, n := range req.Notifications {
+			id := uuid.New().String()
+			_, err := tx.Exec(ctx, `
+				INSERT INTO notifications (id, batch_id, recipient, channel, content, priority)
+				VALUES ($1, $2, $3, $4, $5, $6)`,
+				id, batchID, n.Recipient, n.Channel, n.Content, prios[i])
+			if err != nil {
+				log.Printf("batch insert failed at index %d: %v", i, err)
+				writeError(w, http.StatusInternalServerError, "Could not save the batch")
+				return
+			}
+			ids = append(ids, id)
+
+		}
+		if err := tx.Commit(ctx); err != nil {
+			log.Printf("commit failed: %v", err)
+			writeError(w, http.StatusInternalServerError, "could not save the batch")
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{"batch_id": batchID, "count": len(ids), "ids": ids})
+	}
+}
+
 func main() {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
@@ -279,6 +368,7 @@ func main() {
 	http.HandleFunc("GET /notifications/{id}", getNotificationHandler(pool))
 	http.HandleFunc("POST /notifications/{id}/cancel", cancelNotificationHandler(pool))
 	http.HandleFunc("GET /notifications", listNotificationsHandler(pool))
+	http.HandleFunc("POST /notifications/batch", createBatchHandler(pool))
 	fmt.Println("Listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }

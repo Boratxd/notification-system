@@ -12,10 +12,19 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+const (
+	worketCount   = 20
+	queueSize     = 100
+	ratePerSecond = 100
 )
 
 type job struct {
@@ -60,27 +69,59 @@ func main() {
 
 	client := &http.Client{Timeout: 10 * time.Second}
 
-	logger.Info("worker started")
-	ticker := time.NewTicker(500 * time.Millisecond)
+	limiters := map[string]*rate.Limiter{}
+	for _, ch := range []string{"sms", "email", "push"} {
+		limiters[ch] = rate.NewLimiter(rate.Limit(ratePerSecond), 1)
+	}
+
+	bg := context.WithoutCancel(ctx)
+	jobsCh := make(chan job, queueSize)
+
+	var wg sync.WaitGroup
+	for i := 0; i < worketCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobsCh {
+				if err := limiters[j.Channel].Wait(bg); err != nil {
+					logger.Error("rate limiter wait failed", "id", j.ID, "error", err)
+					continue
+				}
+				process(bg, pool, client, webhookURL, logger, j)
+			}
+		}()
+	}
+
+	logger.Info("worker started", "workers", worketCount, "rate_per_second", ratePerSecond)
+	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 
+loop:
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Info("worker stopping")
-			return
+			break loop
 		case <-ticker.C:
-			jobs, err := claim(ctx, pool, 10)
+			free := queueSize - len(jobsCh)
+			if free <= 0 {
+				continue
+			}
+			jobs, err := claim(ctx, pool, free)
 			if err != nil {
-				logger.Error("claim failed", "error", err)
+				if ctx.Err() == nil {
+					logger.Error("claim failed", "error", err)
+				}
 				continue
 			}
 			for _, j := range jobs {
-				process(ctx, pool, client, webhookURL, logger, j)
+				jobsCh <- j
 			}
 		}
 	}
-
+	logger.Info("worker stopping, draining in-flight jobs")
+	close(jobsCh)
+	wg.Wait()
+	logger.Info("worker stopped")
 }
 
 func claim(ctx context.Context, pool *pgxpool.Pool, limit int) ([]job, error) {

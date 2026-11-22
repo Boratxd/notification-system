@@ -169,17 +169,7 @@ func process(ctx context.Context, pool *pgxpool.Pool, client *http.Client, url s
 	respBody, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		f := failure{reason: fmt.Sprintf("Provider returned %d", resp.StatusCode)}
-		switch {
-		case resp.StatusCode == http.StatusTooManyRequests:
-			f.retryable = true
-			if secs, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && secs > 0 {
-				f.retryAfter = time.Duration(secs) * time.Second
-			}
-		case resp.StatusCode >= 500 || resp.StatusCode == http.StatusRequestTimeout:
-			f.retryable = true
-		}
-		handleFailure(ctx, pool, logger, j.ID, f)
+		handleFailure(ctx, pool, logger, j.ID, classifyStatus(resp.StatusCode, resp.Header.Get("Retry-After")))
 		return
 	}
 	var pr providerResponse
@@ -232,4 +222,18 @@ func handleFailure(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger,
 	} else {
 		logger.Error("delivery failed permanently", "id", id, "reason", f.reason, "attempts", attempts)
 	}
+}
+
+func classifyStatus(code int, retryAfterHeader string) failure {
+	f := failure{reason: fmt.Sprintf("provider returned %d", code)}
+	switch {
+	case code == http.StatusTooManyRequests:
+		f.retryable = true
+		if secs, err := strconv.Atoi(retryAfterHeader); err == nil && secs > 0 {
+			f.retryAfter = time.Duration(secs) * time.Second
+		}
+	case code >= 500 || code == http.StatusRequestTimeout:
+		f.retryable = true
+	}
+	return f
 }

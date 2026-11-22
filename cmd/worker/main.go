@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -26,6 +28,12 @@ type job struct {
 type providerResponse struct {
 	MessageID string `json:"messageId"`
 	Status    string `json:"status"`
+}
+
+type failure struct {
+	reason     string
+	retryable  bool
+	retryAfter time.Duration
 }
 
 func main() {
@@ -111,14 +119,24 @@ func process(ctx context.Context, pool *pgxpool.Pool, client *http.Client, url s
 
 	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
-		markFailed(ctx, pool, logger, j.ID, fmt.Sprintf("Request error: %v", err))
+		handleFailure(ctx, pool, logger, j.ID, failure{reason: fmt.Sprintf("request error: %v", err), retryable: true})
 		return
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		markFailed(ctx, pool, logger, j.ID, fmt.Sprintf("provider returned %d", resp.StatusCode))
+		f := failure{reason: fmt.Sprintf("Provider returned %d", resp.StatusCode)}
+		switch {
+		case resp.StatusCode == http.StatusTooManyRequests:
+			f.retryable = true
+			if secs, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && secs > 0 {
+				f.retryAfter = time.Duration(secs) * time.Second
+			}
+		case resp.StatusCode >= 500 || resp.StatusCode == http.StatusRequestTimeout:
+			f.retryable = true
+		}
+		handleFailure(ctx, pool, logger, j.ID, f)
 		return
 	}
 	var pr providerResponse
@@ -134,15 +152,41 @@ func process(ctx context.Context, pool *pgxpool.Pool, client *http.Client, url s
 	}
 	logger.Info("notification sent", "id", j.ID, "channel", j.Channel, "provider_message_id", pr.MessageID)
 }
+func backoff(attempt int) time.Duration {
+	d := time.Duration(1<<uint(attempt)) * time.Second
+	if d > 5*time.Minute {
+		d = 5 * time.Minute
+	}
+	return d + time.Duration(rand.Int63n(int64(d)/5))
+}
 
-func markFailed(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger, id, reason string) {
-	_, err := pool.Exec(ctx, `
+func handleFailure(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger, id string, f failure) {
+	var attempts int
+	_ = pool.QueryRow(ctx, `SELECT attempts FROM notifications WHERE id = $1`, id).Scan(&attempts)
+
+	wait := backoff(attempts)
+	if f.retryAfter > wait {
+		wait = f.retryAfter
+	}
+
+	var status string
+	err := pool.QueryRow(ctx, `
 		UPDATE notifications
-		SET status = 'failed', last_error = $2, locked_until = NULL, updated_at = now()
-		WHERE id = $1 AND status = 'processing'`, id, reason)
+		SET status = CASE WHEN $3::boolean AND attempts < max_attempts THEN 'pending' ELSE 'failed' END,
+		    next_attempt_at = CASE WHEN $3::boolean AND attempts < max_attempts
+		                           THEN now() + make_interval(secs => $4::float8)
+		                           ELSE next_attempt_at END,
+		    last_error = $2, locked_until = NULL, updated_at = now()
+		WHERE id = $1 AND status = 'processing'
+		RETURNING status`, id, f.reason, f.retryable, wait.Seconds()).Scan(&status)
+
 	if err != nil {
-		logger.Error("mark failed", "id", id, "error", err)
+		logger.Error("Handle failure failed", "id", id, "error", err)
 		return
 	}
-	logger.Warn("notification failed", "id", id, "reason", reason)
+	if status == "pending" {
+		logger.Warn("delivery failed, will retry", "id", id, "reason", f.reason, "attempts", attempts, "retry_in", wait.String())
+	} else {
+		logger.Error("delivery failed permanently", "id", id, "reason", f.reason, "attempts", attempts)
+	}
 }

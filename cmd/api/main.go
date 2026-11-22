@@ -392,6 +392,27 @@ func metricsHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	}
 }
 
+func newMux(pool *pgxpool.Pool) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := pool.Ping(ctx); err != nil {
+			http.Error(w, "database down", http.StatusServiceUnavailable)
+			return
+		}
+		fmt.Fprintln(w, "ok")
+
+	})
+	mux.HandleFunc("POST /notifications", createNotificationHandler(pool))
+	mux.HandleFunc("GET /notifications/{id}", getNotificationHandler(pool))
+	mux.HandleFunc("POST /notifications/{id}/cancel", cancelNotificationHandler(pool))
+	mux.HandleFunc("GET /notifications", listNotificationsHandler(pool))
+	mux.HandleFunc("POST /notifications/batch", createBatchHandler(pool))
+	mux.HandleFunc("GET /metrics", metricsHandler(pool))
+	return mux
+}
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	dbURL := os.Getenv("DATABASE_URL")
@@ -413,12 +434,6 @@ func main() {
 		fmt.Fprintln(w, "ok")
 	})
 
-	http.HandleFunc("POST /notifications", createNotificationHandler(pool))
-	http.HandleFunc("GET /notifications/{id}", getNotificationHandler(pool))
-	http.HandleFunc("POST /notifications/{id}/cancel", cancelNotificationHandler(pool))
-	http.HandleFunc("GET /notifications", listNotificationsHandler(pool))
-	http.HandleFunc("POST /notifications/batch", createBatchHandler(pool))
-	http.HandleFunc("GET /metrics", metricsHandler(pool))
 	logger.Info("api listening", "addr", ":8080")
 	log.Fatal(http.ListenAndServe(":8080", withLogging(logger, http.DefaultServeMux)))
 }
